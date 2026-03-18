@@ -1,0 +1,94 @@
+name: Apex Index Scalper Bot
+on:
+  workflow_dispatch:  # Manual trigger only
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Display IST time
+      run: |
+        echo "==========================================="
+        echo "🚀 Apex Index Scalper Bot Starting..."
+        echo "==========================================="
+        echo "UTC Time: $(date -u)"
+        echo "IST Time: $(TZ='Asia/Kolkata' date)"
+        echo "==========================================="
+    
+    - name: Run trading bot
+      run: python -u algo_trader.py
+      timeout-minutes: 390  # 6.5 hours (market session)
+      env:
+        PYTHONUNBUFFERED: 1      # Force unbuffered output
+        TZ: 'Asia/Kolkata'       # Set IST timezone
+    
+    - name: Upload trade logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: trade-logs-${{ github.run_number }}
+        path: trade_logs/
+        retention-days: 30
+        if-no-files-found: warn
+    
+    - name: Upload terminal logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: terminal-logs-${{ github.run_number }}
+        path: terminal_logs/
+        retention-days: 30
+        if-no-files-found: warn
+    
+    - name: Upload summary
+      if: always()
+      run: |
+        echo "==========================================="
+        echo "📊 Trading Session Summary"
+        echo "==========================================="
+        echo "Run Number: ${{ github.run_number }}"
+        echo "Timestamp: $(TZ='Asia/Kolkata' date)"
+        echo "==========================================="
+        
+        # Check trade logs
+        if [ -d "trade_logs" ] && [ "$(ls -A trade_logs)" ]; then
+          echo "✅ Trade logs created:"
+          for file in trade_logs/*.csv; do
+            if [ -f "$file" ]; then
+              echo "   📄 $(basename $file) - $(wc -l < $file) lines"
+            fi
+          done
+        else
+          echo "⚠️ No trade logs found"
+        fi
+        
+        echo "-------------------------------------------"
+        
+        # Check terminal logs
+        if [ -d "terminal_logs" ] && [ "$(ls -A terminal_logs)" ]; then
+          echo "✅ Terminal logs created:"
+          for file in terminal_logs/*.log; do
+            if [ -f "$file" ]; then
+              size=$(du -h "$file" | cut -f1)
+              echo "   📄 $(basename $file) - $size"
+            fi
+          done
+        else
+          echo "⚠️ No terminal logs found"
+        fi
+        
+        echo "==========================================="
