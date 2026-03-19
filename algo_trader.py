@@ -48,11 +48,9 @@ if sys.platform.startswith('win'):
 
 import csv
 import time
-import json
 import logging
 import asyncio
 import aiohttp
-import requests
 import pandas as pd
 import numpy as np
 import traceback
@@ -61,7 +59,7 @@ from datetime import datetime, date, timedelta, timezone
 # =============================================================================
 # CONFIGURATION (EDIT HERE)
 # =============================================================================
-UPSTOX_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI1NUJBOVgiLCJqdGkiOiI2OWJhMWUyZjYzNmQ0YzFiYjVlNjdhYmEiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc3MzgwNTEwMywiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxNzczODcxMjAwfQ.KPQXocZ-AyOaXN7CBiKOU4SZ-W-iSixzyPYyjVmWmBc"
+UPSTOX_TOKEN = ""
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1412386951474057299/Jgft_nxzGxcfWOhoLbSWMde-_bwapvqx8l3VQGQwEoR7_8n4b9Q9zN242kMoXsVbLdvG"
 
 INSTRUMENT = "NSE_INDEX|Nifty 50"  # Or "NSE_INDEX|Nifty Bank"
@@ -99,6 +97,16 @@ file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(messa
 logging.basicConfig(level=logging.INFO, handlers=[stream_handler, file_handler])
 log = logging.getLogger("AlgoTrader")
 
+def log_out(text, level="info"):
+    """Logs to terminal and file. Redundant print removed since logger has a StreamHandler."""
+    if level == "info": log.info(text)
+    elif level == "warning": log.warning(text)
+    elif level == "error": log.error(text)
+
+def round_to_tick(price):
+    """Round price to the nearest 0.05 tick size for Upstox."""
+    return round(round(price / 0.05) * 0.05, 2)
+
 # =============================================================================
 # POSITION TRACKING & RISK STATE
 # =============================================================================
@@ -125,6 +133,8 @@ class State:
 
     pos_breakeven_locked = False
     pos_entry_spot = 0.0
+    pos_entry_time = None
+    pos_sl_order_id = None
     
     @classmethod
     def reset(cls):
@@ -145,13 +155,15 @@ class State:
         cls.pos_lowest = 0.0
         cls.pos_ins_key = None
         cls.pos_tp_spot = 0.0
+        cls.pos_entry_time = None
+        cls.pos_sl_order_id = None
 
 # =============================================================================
 # TRADE JOURNAL (CSV)
 # =============================================================================
 if not os.path.exists(TRADES_CSV):
     with open(TRADES_CSV, "w", newline="") as f:
-        csv.writer(f).writerow(["timestamp", "signal", "strike", "entry_price", "exit_price", "pnl"])
+        csv.writer(f).writerow(["entry_time", "exit_time", "signal", "strike", "entry_price", "exit_price", "pnl"])
 
 # =============================================================================
 # DISCORD ALERTS
@@ -387,9 +399,13 @@ def calc_indicators(df):
     df["vwap"] = df["cum_tp_vol"] / df["cum_vol"]
     
     # ATR 14
+    # Gap-Filtering: On the first candle of the day, TR = high - low (exclude overnight gap shock)
+    is_first_candle = df["date"] != df["date"].shift(1)
     df["tr"] = np.maximum(df["high"] - df["low"], 
                  np.maximum(abs(df["high"] - df["close"].shift(1)), 
                             abs(df["low"] - df["close"].shift(1))))
+    df.loc[is_first_candle, "tr"] = df["high"] - df["low"]
+    
     # ATR(14): Wilder's smoothing (RMA) to match TradingView; alpha = 1/14
     df["atr_14"] = df["tr"].ewm(alpha=1/14, adjust=False).mean()
     df["atr_rolling_mean"] = df["atr_14"].rolling(20).mean()
@@ -417,7 +433,7 @@ def calc_indicators(df):
 # =============================================================================
 # TERMINAL DASHBOARD
 # =============================================================================
-def print_market_snapshot(spot, df_5m, df_15m, signal, support, resistance):
+def print_market_snapshot(spot, df_5m, df_15m, signal, support, resistance, market_status="TRADING"):
     if df_5m.empty or df_15m.empty: return
     
     c5 = df_5m.iloc[-1]
@@ -437,7 +453,13 @@ def print_market_snapshot(spot, df_5m, df_15m, signal, support, resistance):
     
     now = datetime.now().strftime("%I:%M:%S %p")
     mode = "🔴 LIVE" if EXECUTE_TRADE else "📝 PAPER"
-    
+
+    state_text = signal if signal else '⏸ WAITING FOR CONDITIONS'
+    if market_status == "WAITING_FOR_OPEN":
+        state_text = "⏸ WAITING FOR ENTRY WINDOW (09:30 AM)"
+    elif market_status == "CLOSED_FOR_ENTRY":
+        state_text = "⏸ CLOSED FOR ENTRY (AFTER 14:45)"
+
     snapshot = f"""{'=' * 85}
 ⚡ ALGO TRADER | {now} | {mode}
 {'=' * 85}
@@ -452,10 +474,10 @@ def print_market_snapshot(spot, df_5m, df_15m, signal, support, resistance):
   CALL (CE): {'✅' if is_15m_up else '❌'} 15m Up | {'✅' if is_5m_up else '❌'} 5m Up | {'✅' if atr_expand else '❌'} ATR Exp | {'✅' if imbalance > 0.3 else '❌'} Imbal > 0.3
   PUT (PE) : {'✅' if is_15m_dn else '❌'} 15m Dn | {'✅' if is_5m_dn else '❌'} 5m Dn | {'✅' if atr_expand else '❌'} ATR Exp | {'✅' if imbalance < -0.3 else '❌'} Imbal < -0.3
 
-🎯 STATE: {signal if signal else '⏸ WAITING FOR CONDITIONS'}
+🎯 STATE: {state_text}
 {'=' * 85}"""
-    # Print snapshot
-    print(snapshot)
+    # Print snapshot both to terminal and log file
+    log_out(snapshot)
 
 def print_trade_dashboard(spot, premium, entry, tp, sl, pnl, strike, opt_type):
     """Prints a clean, single-line update for continuous P&L logging."""
@@ -467,7 +489,7 @@ def print_trade_dashboard(spot, premium, entry, tp, sl, pnl, strike, opt_type):
         f"LTP: ₹{premium:.2f} | Entry: ₹{entry:.2f} | "
         f"Strike: {str(strike)}{opt_type} | SL: ₹{sl:.2f} | TP: ₹{tp:.2f}"
     )
-    print(line, flush=True)
+    log_out(line)
 
 def log_signal_alert(signal, strike, buy_price, sl_premium, tp_premium, spot, support, resistance, expiry):
     """Logs a compact signal alert box."""
@@ -505,6 +527,60 @@ async def place_order(session, instrument_token, qty, side="BUY"):
         return True
     return False
 
+async def check_order_status(session, order_id):
+    """Check the status of an order (V2 API)."""
+    if not EXECUTE_TRADE or not order_id or order_id.startswith("PAPER"):
+        return "complete"
+    
+    # Get order history/details
+    res = await UpstoxClient.get(session, "/order/details", {"order_id": order_id})
+    if res:
+        # V2 details is often a list of history for that order_id
+        if isinstance(res, list) and len(res) > 0:
+            return res[0].get("status", "").lower()
+        elif isinstance(res, dict):
+            return res.get("status", "").lower()
+    return None
+
+async def cancel_order(session, order_id):
+    """Cancel an open order on the exchange."""
+    if not EXECUTE_TRADE or not order_id: return True
+    res = await UpstoxClient.get(session, "/order/cancel", {"order_id": order_id})
+    if res:
+        log.info(f"🚫 Order {order_id} cancelled.")
+        return True
+    return False
+
+async def place_sl_order(session, instrument_token, qty, trigger_price):
+    """Place a real SL-Limit order on the exchange."""
+    if not EXECUTE_TRADE:
+        log.info(f"PAPER SL: {qty} {instrument_token} @ Trigger {trigger_price:.2f}")
+        return f"PAPER_SL_{int(time.time())}"
+
+    # For SL-Limit, set limit price slightly below trigger for prompt execution (BUY entry means SELL SL)
+    # Using 1.5 point buffer for Nifty options as a safe margin.
+    limit_price = round_to_tick(max(0.05, trigger_price - 1.5))
+    trigger_price = round_to_tick(trigger_price)
+
+    payload = {
+        "quantity": qty,
+        "product": "I",
+        "validity": "DAY",
+        "price": limit_price,
+        "instrument_token": instrument_token,
+        "order_type": "SL",
+        "transaction_type": "SELL",
+        "disclosed_quantity": 0,
+        "trigger_price": trigger_price,
+        "is_amo": False,
+    }
+    res = await UpstoxClient.post(session, "/order/place", payload)
+    if res:
+        order_id = res.get("order_id")
+        log.info(f"🛡️ SL ORDER PLACED: Trigger ₹{trigger_price:.2f} | ID: {order_id}")
+        return order_id
+    return None
+
 
 # =============================================================================
 # TRAILING STOP (REST LTP fallback when WebSocket Protobuf not decoded)
@@ -517,15 +593,18 @@ async def ltp_loop(session):
                 spot_ltp = res.get(INSTRUMENT.replace("|", ":"), {}).get("last_price", 0)
                 if spot_ltp > 0:
                     if State.pos_side == "BUY_CALL":
-                        # Profit Locking: If price moves 1R into profit, lock Break-Even
-                        if not State.pos_breakeven_locked and spot_ltp >= (State.pos_entry_spot + State.pos_stop_distance):
+                        # Aggressive Profit Locking: If price moves 0.7R into profit, lock Break-Even
+                        if not State.pos_breakeven_locked and spot_ltp >= (State.pos_entry_spot + 0.7 * State.pos_stop_distance):
                             State.pos_breakeven_locked = True
                             State.pos_stop = State.pos_entry_spot
-                            log.info(f"Smart Profit Locking: Stop moved to Break-Even (Entry: {State.pos_entry_spot})")
+                            log.info(f"🛡️ Aggressive BE Locked: Stop moved to Entry ({State.pos_entry_spot})")
+                            await send_discord("Profit Protection", f"🛡️ **BE Locked:** SL moved to Entry price ({State.pos_entry_spot})", color=0x3498DB)
                         
                         State.pos_highest = max(State.pos_highest, spot_ltp)
-                        # Trail stop only if not locked at BE or if trail is higher than entry
-                        new_stop = State.pos_highest - State.pos_stop_distance
+                        
+                        # Dynamic Trailing: Maintain 1.5x ATR distance after BE is locked
+                        trail_dist = State.pos_stop_distance if not State.pos_breakeven_locked else (State.pos_stop_distance * 1.0)
+                        new_stop = State.pos_highest - trail_dist
                         State.pos_stop = max(State.pos_stop, new_stop)
                         
                         if spot_ltp <= State.pos_stop:
@@ -533,15 +612,18 @@ async def ltp_loop(session):
                             await close_position(session, "SL_HIT")
                             
                     elif State.pos_side == "BUY_PUT":
-                        # Profit Locking: If price moves 1R into profit, lock Break-Even
-                        if not State.pos_breakeven_locked and spot_ltp <= (State.pos_entry_spot - State.pos_stop_distance):
+                        # Aggressive Profit Locking: If price moves 0.7R into profit, lock Break-Even
+                        if not State.pos_breakeven_locked and spot_ltp <= (State.pos_entry_spot - 0.7 * State.pos_stop_distance):
                             State.pos_breakeven_locked = True
                             State.pos_stop = State.pos_entry_spot
-                            log.info(f"Smart Profit Locking: Stop moved to Break-Even (Entry: {State.pos_entry_spot})")
+                            log.info(f"🛡️ Aggressive BE Locked: Stop moved to Entry ({State.pos_entry_spot})")
+                            await send_discord("Profit Protection", f"🛡️ **BE Locked:** SL moved to Entry price ({State.pos_entry_spot})", color=0x3498DB)
                             
                         State.pos_lowest = min(State.pos_lowest, spot_ltp) if State.pos_lowest > 0 else spot_ltp
-                        # Trail stop only if not locked at BE or if trail is lower than entry
-                        new_stop = State.pos_lowest + State.pos_stop_distance
+                        
+                        # Dynamic Trailing: Maintain 1.5x ATR distance after BE is locked
+                        trail_dist = State.pos_stop_distance if not State.pos_breakeven_locked else (State.pos_stop_distance * 1.0)
+                        new_stop = State.pos_lowest + trail_dist
                         if State.pos_stop == 0: State.pos_stop = new_stop
                         State.pos_stop = min(State.pos_stop, new_stop)
                         
@@ -560,6 +642,10 @@ async def close_position(session, reason="SQUARE_OFF"):
     exit_price = await UpstoxClient.get_option_premium(session, State.pos_ins_key)
     if exit_price is None:
         exit_price = State.pos_entry
+
+    # Cancel any pending exchange SL order first
+    if State.pos_sl_order_id:
+        await cancel_order(session, State.pos_sl_order_id)
 
     # Place SELL order
     await place_order(session, State.pos_ins_key, State.pos_qty, "SELL")
@@ -594,10 +680,11 @@ async def close_position(session, reason="SQUARE_OFF"):
               f"━━━━━━━━━━━━━━━━━━━━━━━━"
         await send_discord("Trade Closed", msg, color=0x00FF00)
     
-    # Log CSV with formatted timestamp for spreadsheet compatibility
+    # Log CSV with precise entry and exit times
     with open(TRADES_CSV, "a", newline="") as f:
-        formatted_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        csv.writer(f).writerow([formatted_now, State.pos_side, State.pos_strike, State.pos_entry, exit_price, pnl])
+        exit_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry_time = State.pos_entry_time or "N/A"
+        csv.writer(f).writerow([entry_time, exit_time, State.pos_side, State.pos_strike, State.pos_entry, exit_price, pnl])
         
     State.reset()
     
@@ -668,7 +755,7 @@ async def main_loop():
 
 🎯 STATE: ⏸ WAITING FOR CANDLE DATA (Needs 20+ Bars)
 {'=' * 85}"""
-                        print(snapshot)
+                        log_out(snapshot)
                     await asyncio.sleep(5)
                     continue
                     
@@ -696,17 +783,21 @@ async def main_loop():
                 signal = None
 
                 # -----------------------------------------------------------------
-                # OUTSIDE HOURS INFO BANNER (e.g. after 15:30, before 09:20)
+                # MARKET ENTRY WINDOW CHECK
                 # -----------------------------------------------------------------
-                if not is_valid_entry_time and not State.in_trade:
-                    print(
-                        "\n⏸ Outside entry hours (09:30–14:45). "
-                        f"Time now: {now.strftime('%I:%M:%S %p')}. "
-                        "No new trades will be taken today.",
-                        flush=True,
-                    )
+                market_status = "TRADING"
+                if not is_valid_entry_time:
+                    if now.hour < 9 or (now.hour == 9 and now.minute < 30):
+                        market_status = "WAITING_FOR_OPEN"
+                    else:
+                        market_status = "CLOSED_FOR_ENTRY"
+
+                if market_status != "TRADING" and not State.in_trade:
+                    # Clear screen if we just transitioned to a "waiting" state
+                    # We'll use the already established clear logic below.
+                    pass
                 
-                # Buy Call Condition (volume spike removed from entry filter)
+                # Buy Call Condition
                 if is_valid_entry_time and is_15m_up and is_5m_up and atr_expand:
                     if imbalance > 0.3 or bull_trap:
                         signal = "BUY_CALL"
@@ -724,10 +815,9 @@ async def main_loop():
                         f"Signal {signal} detected at {now.strftime('%H:%M')} "
                         f"but outside entry window (09:30–14:45). No trade taken."
                     )
-                    print(
+                    log_out(
                         f"\n⚠ Signal {signal} detected but outside entry hours "
-                        f"(09:30–14:45). Waiting for next session.",
-                        flush=True,
+                        f"(09:30–14:45). Waiting for next session."
                     )
                     # For the dashboard, treat this loop as 'waiting' (no active signal)
                     signal = None
@@ -738,17 +828,17 @@ async def main_loop():
                     if waiting_line_count >= 10:
                         os.system('cls' if os.name == 'nt' else 'clear')
                         waiting_line_count = 0
-                    print_market_snapshot(spot, df_5m, df_15m, signal, support, resistance)
-                    # Show banner only after 15:30 (entry window end) and before square-off
-                    after_entry_window = (now.hour > 15) or (now.hour == 15 and now.minute > 30)
-                    if after_entry_window and now.strftime("%H:%M") < SQUARE_OFF_TIME:
-                        print(
-                            f"\n⏸ Outside entry hours (09:30–14:45). "
-                            f"Time now: {now.strftime('%I:%M:%S %p')}. "
-                            "No new trades will be taken today.",
-                            flush=True,
-                        )
+                    print_market_snapshot(spot, df_5m, df_15m, signal, support, resistance, market_status)
                 else:
+                    # 0. Sync with Exchange: Check if the real SL order was already hit
+                    if State.pos_sl_order_id:
+                        status = await check_order_status(session, State.pos_sl_order_id)
+                        if status in ("complete", "filled"):
+                            log.info(f"🛡️ Exchange SL Order {State.pos_sl_order_id} hit! Resetting state.")
+                            # Exit premium is approx sl_premium
+                            State.reset()
+                            continue
+
                     # Option premium from quotes API (Day's Open strategy logic)
                     opt_premium = await UpstoxClient.get_option_premium(session, State.pos_ins_key)
                     opt_ltp = opt_premium if opt_premium is not None else State.pos_entry
@@ -816,17 +906,17 @@ async def main_loop():
                         base_risk = stop_distance * DELTA_APPROX
                         risk_per_unit = min(base_risk, opt_ltp * 0.7)
                         
-                        sl_premium = opt_ltp - risk_per_unit
-                        tp_premium = opt_ltp + 1.5 * risk_per_unit
+                        sl_premium = round_to_tick(opt_ltp - risk_per_unit)
+                        tp_premium = round_to_tick(opt_ltp + 1.5 * risk_per_unit)
                         
                         # Dynamic OI-Based Target (Adjust TP based on Support/Resistance)
                         if signal == "BUY_CALL" and resistance and float(resistance) > spot:
                             res_spot_diff = float(resistance) - spot
-                            tp_premium = min(tp_premium, opt_ltp + (res_spot_diff * DELTA_APPROX))
+                            tp_premium = round_to_tick(min(tp_premium, opt_ltp + (res_spot_diff * DELTA_APPROX)))
                             log.info(f"Dynamic TP adjusted by OI Resistance: {resistance}")
                         elif signal == "BUY_PUT" and support and float(support) < spot:
                             sup_spot_diff = spot - float(support)
-                            tp_premium = min(tp_premium, opt_ltp + (sup_spot_diff * DELTA_APPROX))
+                            tp_premium = round_to_tick(min(tp_premium, opt_ltp + (sup_spot_diff * DELTA_APPROX)))
                             log.info(f"Dynamic TP adjusted by OI Support: {support}")
 
                         # Log professional signal alert
@@ -857,9 +947,14 @@ async def main_loop():
                         State.pos_tp_premium = tp_premium
                         State.pos_tp_spot = spot + 1.5 * stop_distance if signal == "BUY_CALL" else spot - 1.5 * stop_distance
                         State.pos_ins_key = instrument_key
+                        State.pos_entry_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         State.in_trade = True
                         
                         await place_order(session, State.pos_ins_key, qty, "BUY")
+                        
+                        # Immediately place a real SL order on the exchange for safety
+                        sl_order_id = await place_sl_order(session, State.pos_ins_key, qty, sl_premium)
+                        State.pos_sl_order_id = sl_order_id
                         
                         order_msg = f"💰 **ORDER PLACED SUCCESSFULLY**\n" \
                                     f"━━━━━━━━━━━━━━━━━━━━━━━━\n" \
