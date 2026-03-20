@@ -59,7 +59,7 @@ from datetime import datetime, date, timedelta, timezone
 # =============================================================================
 # CONFIGURATION (EDIT HERE)
 # =============================================================================
-UPSTOX_TOKEN = ""
+UPSTOX_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI1NUJBOVgiLCJqdGkiOiI2OWJjYzA5ZmYzNzhjMDcwMmRiZTkyMmIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc3Mzk3Nzc1OSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxNzc0MDQ0MDAwfQ.rp95wCBgcbYrHOBCd8FiLoor4YaGdDsP2E4v4pVcxww"
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1412386951474057299/Jgft_nxzGxcfWOhoLbSWMde-_bwapvqx8l3VQGQwEoR7_8n4b9Q9zN242kMoXsVbLdvG"
 
 INSTRUMENT = "NSE_INDEX|Nifty 50"  # Or "NSE_INDEX|Nifty Bank"
@@ -221,16 +221,12 @@ class UpstoxClient:
     @classmethod
     async def get_candles(cls, session, instrument_key, interval="5minute", days=4):
         # We MUST fetch historical data even for "intraday only" trading.
-        # Why? A 20-period moving average on a 15-minute timeframe requires 300 minutes (5 hours) of data.
-        # If we only pull today's data, the 15m indicators wouldn't activate until 2:15 PM!
-        
         to_date = date.today().strftime("%Y-%m-%d")
         from_date = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
         
         hist_endpoint = f"/historical-candle/{instrument_key}/1minute/{to_date}/{from_date}"
         intra_endpoint = f"/historical-candle/intraday/{instrument_key}/1minute"
         
-        # Concurrent API execution
         hist_task = cls.get(session, hist_endpoint)
         intra_task = cls.get(session, intra_endpoint)
         
@@ -248,7 +244,6 @@ class UpstoxClient:
         df = pd.DataFrame(all_candles, columns=["datetime", "open", "high", "low", "close", "volume", "oi"])
         df["datetime"] = pd.to_datetime(df["datetime"])
         
-        # Nifty Options volume fixes to avoid zero divides
         df["volume"] = df["volume"].replace(0, 1)
         
         df = df.drop_duplicates(subset=["datetime"])
@@ -259,7 +254,6 @@ class UpstoxClient:
             
         df.set_index("datetime", inplace=True)
         
-        # Resample logic
         rule = "5min" if interval == "5minute" else "15min"
         
         df_resampled = df.resample(rule).agg({
@@ -275,7 +269,6 @@ class UpstoxClient:
 
     @classmethod
     async def get_option_chain(cls, session, instrument_key):
-        # Dynamically fetch the nearest available expiry date to avoid holiday misalignments
         contract_url = "/option/contract"
         contracts = await cls.get(session, contract_url, {"instrument_key": instrument_key})
         
@@ -288,7 +281,6 @@ class UpstoxClient:
             
         nearest_expiry = expiries[0]
         
-        # Fetch live spot to filter near-ATM strikes only
         spot_res = await cls.get(session, "/market-quote/ltp", {"instrument_key": instrument_key})
         spot = 0
         if spot_res:
@@ -310,7 +302,6 @@ class UpstoxClient:
             if not strike:
                 continue
             
-            # Only look at strikes within +/- 3 strikes of current spot (Strict Intraday Zone)
             range_limit = STRIKE_STEP * 3
             if spot > 0 and abs(strike - spot) > range_limit:
                 continue
@@ -329,13 +320,6 @@ class UpstoxClient:
 
     @classmethod
     async def get_option_premium(cls, session, instrument_key):
-        """
-        Fetch current option premium (LTP) via quotes API.
-        Primary: /market-quote/quotes
-        Fallback: /market-quote/ltp
-        Both parsed like Day's Open strategy: robust over last_price/ltp/last_traded_price.
-        Returns float or None.
-        """
         if not instrument_key:
             return None
 
@@ -343,8 +327,6 @@ class UpstoxClient:
             data = await cls.get(session, endpoint, {"instrument_key": instrument_key})
             if not data:
                 return None
-
-            # Shape 1: dict of instruments -> dict(ltp/last_price/last_traded_price)
             if isinstance(data, dict):
                 for _, v in data.items():
                     if isinstance(v, dict):
@@ -354,8 +336,6 @@ class UpstoxClient:
                                 return float(premium)
                             except (TypeError, ValueError):
                                 continue
-
-            # Shape 2: list of dicts
             if isinstance(data, list):
                 for v in data:
                     if isinstance(v, dict):
@@ -365,19 +345,14 @@ class UpstoxClient:
                                 return float(premium)
                             except (TypeError, ValueError):
                                 continue
-
             return None
 
-        # Try quotes first
         prem = await _extract_premium("/market-quote/quotes")
         if prem is not None:
             return prem
-
-        # Fallback to LTP if quotes fails
         prem = await _extract_premium("/market-quote/ltp")
         if prem is not None:
             return prem
-
         return None
 
 
@@ -399,7 +374,8 @@ def calc_indicators(df):
     df["vwap"] = df["cum_tp_vol"] / df["cum_vol"]
     
     # ATR 14
-    # Gap-Filtering: On the first candle of the day, TR = high - low (exclude overnight gap shock)
+    # OVERCOME GAP-UP / GAP-DOWN ATR DISTORTION
+    # For the first candle of the day, ignore the overnight gap (Previous Close)
     is_first_candle = df["date"] != df["date"].shift(1)
     df["tr"] = np.maximum(df["high"] - df["low"], 
                  np.maximum(abs(df["high"] - df["close"].shift(1)), 
@@ -411,7 +387,6 @@ def calc_indicators(df):
     df["atr_rolling_mean"] = df["atr_14"].rolling(20).mean()
     
     # Buy/Sell Volume Imbalance
-    # Estimate: If close > open -> more buy vol. If close < open -> more sell vol.
     df["is_bull"] = df["close"] >= df["open"]
     df["buy_vol"] = np.where(df["is_bull"], df["volume"] * 0.7, df["volume"] * 0.3)
     df["sell_vol"] = np.where(df["is_bull"], df["volume"] * 0.3, df["volume"] * 0.7)
@@ -422,10 +397,7 @@ def calc_indicators(df):
     df["roll_low_20"] = df["low"].rolling(20).min().shift(1)
     
     # Liquidity Sweeps
-    # Bearish Trap: Price breaks above rolling 20 high but closes below
     df["bearish_trap"] = (df["high"] > df["roll_high_20"]) & (df["close"] < df["roll_high_20"])
-    
-    # Bullish Trap: Price breaks below rolling 20 low but closes above
     df["bullish_trap"] = (df["low"] < df["roll_low_20"]) & (df["close"] > df["roll_low_20"])
     
     return df
@@ -447,7 +419,7 @@ def print_market_snapshot(spot, df_5m, df_15m, signal, support, resistance, mark
     is_5m_up = c5["close"] > c5["ema_20"] and c5["close"] > c5["vwap"]
     is_5m_dn = c5["close"] < c5["ema_20"] and c5["close"] < c5["vwap"]
     
-    # Filters (volume spike now removed from logic; still show volume/ATR/imbalance)
+    # Filters
     atr_expand = c5["atr_14"] > c5["atr_rolling_mean"]
     imbalance = c5["imbalance"]
     
@@ -468,7 +440,7 @@ def print_market_snapshot(spot, df_5m, df_15m, signal, support, resistance, mark
   15m Trend:     {'BULLISH ✅' if is_15m_up else ('BEARISH ❌' if is_15m_dn else 'NEUTRAL ➖')}  |  5m Trend:   {'BULLISH ✅' if is_5m_up else ('BEARISH ❌' if is_5m_dn else 'NEUTRAL ➖')}
   OI Support:    {support or 'N/A':<10}  |  OI Resist:  {resistance or 'N/A':<10}
   ATR(14, 5m):   {c5['atr_14']:8.2f}     |  ATR Mean(20): {c5['atr_rolling_mean']:8.2f}
-  Imbalance:     {c5['imbalance']:8.3f}
+  Imbalance:     {c5['imbalance']:8.3f}    |  Volume(5m): {int(c5['volume']):<10}
 
 🔍 CONDITION EVALUATION (All ✅ required for trade):
   CALL (CE): {'✅' if is_15m_up else '❌'} 15m Up | {'✅' if is_5m_up else '❌'} 5m Up | {'✅' if atr_expand else '❌'} ATR Exp | {'✅' if imbalance > 0.3 else '❌'} Imbal > 0.3
@@ -476,7 +448,6 @@ def print_market_snapshot(spot, df_5m, df_15m, signal, support, resistance, mark
 
 🎯 STATE: {state_text}
 {'=' * 85}"""
-    # Print snapshot both to terminal and log file
     log_out(snapshot)
 
 def print_trade_dashboard(spot, premium, entry, tp, sl, pnl, strike, opt_type):
@@ -530,12 +501,15 @@ async def place_order(session, instrument_token, qty, side="BUY"):
 async def check_order_status(session, order_id):
     """Check the status of an order (V2 API)."""
     if not EXECUTE_TRADE or not order_id or order_id.startswith("PAPER"):
+        # If it's a PAPER SL order, we must return "open", NOT "complete". 
+        # If we return "complete", the bot thinks the Stop-Loss was triggered on the exchange instantly,
+        # resets the trade state, and since the signal is still valid, it buys again endlessly.
+        if order_id and order_id.startswith("PAPER_SL"):
+            return "open"
         return "complete"
     
-    # Get order history/details
     res = await UpstoxClient.get(session, "/order/details", {"order_id": order_id})
     if res:
-        # V2 details is often a list of history for that order_id
         if isinstance(res, list) and len(res) > 0:
             return res[0].get("status", "").lower()
         elif isinstance(res, dict):
@@ -557,8 +531,6 @@ async def place_sl_order(session, instrument_token, qty, trigger_price):
         log.info(f"PAPER SL: {qty} {instrument_token} @ Trigger {trigger_price:.2f}")
         return f"PAPER_SL_{int(time.time())}"
 
-    # For SL-Limit, set limit price slightly below trigger for prompt execution (BUY entry means SELL SL)
-    # Using 1.5 point buffer for Nifty options as a safe margin.
     limit_price = round_to_tick(max(0.05, trigger_price - 1.5))
     trigger_price = round_to_tick(trigger_price)
 
@@ -635,20 +607,26 @@ async def ltp_loop(session):
 # =============================================================================
 # CLOSE POSITION & RISK MANAGEMENT (Daily loss limit, CSV log)
 # =============================================================================
-async def close_position(session, reason="SQUARE_OFF"):
+async def close_position(session, reason="SQUARE_OFF", skip_sell_order=False):
     if not State.in_trade: return
+    State.in_trade = False # Lock instantly to prevent async double-exits from ltp_loop and main_loop
     
     # Get option exit premium (same as Day's Open strategy: quotes API)
     exit_price = await UpstoxClient.get_option_premium(session, State.pos_ins_key)
     if exit_price is None:
         exit_price = State.pos_entry
 
-    # Cancel any pending exchange SL order first
-    if State.pos_sl_order_id:
-        await cancel_order(session, State.pos_sl_order_id)
+    if not skip_sell_order:
+        # Cancel any pending exchange SL order first
+        if State.pos_sl_order_id:
+            await cancel_order(session, State.pos_sl_order_id)
 
-    # Place SELL order
-    await place_order(session, State.pos_ins_key, State.pos_qty, "SELL")
+        # Place SELL order
+        await place_order(session, State.pos_ins_key, State.pos_qty, "SELL")
+    else:
+        # If exchange hard SL was already executed, exit price is exactly the SL premium (or near it)
+        if exit_price is None or exit_price == State.pos_entry:
+            exit_price = State.pos_sl_premium
     
     # PnL: For any BUY position (Call or Put), profit = (exit - entry) * qty
     pnl = (exit_price - State.pos_entry) * State.pos_qty
@@ -721,7 +699,6 @@ async def main_loop():
                 break # Market closed
 
             # Ensure we only ENTER new trades between 09:30 and 14:45 for pure intraday.
-            # Outside this window we still evaluate conditions, but do not enter.
             is_valid_entry_time = (
                 (now.hour > 9 or (now.hour == 9 and now.minute >= 30))
                 and (now.hour < 14 or (now.hour == 14 and now.minute < 45))
@@ -793,8 +770,6 @@ async def main_loop():
                         market_status = "CLOSED_FOR_ENTRY"
 
                 if market_status != "TRADING" and not State.in_trade:
-                    # Clear screen if we just transitioned to a "waiting" state
-                    # We'll use the already established clear logic below.
                     pass
                 
                 # Buy Call Condition
@@ -809,7 +784,7 @@ async def main_loop():
 
                 spot = c5["close"] if spot == 0 else spot
                 
-                # Outside entry window alert: conditions may be met but no new trades are allowed
+                # Outside entry window alert
                 if signal and not State.in_trade and not is_valid_entry_time:
                     log.info(
                         f"Signal {signal} detected at {now.strftime('%H:%M')} "
@@ -819,7 +794,6 @@ async def main_loop():
                         f"\n⚠ Signal {signal} detected but outside entry hours "
                         f"(09:30–14:45). Waiting for next session."
                     )
-                    # For the dashboard, treat this loop as 'waiting' (no active signal)
                     signal = None
 
                 # Print Status
@@ -834,24 +808,19 @@ async def main_loop():
                     if State.pos_sl_order_id:
                         status = await check_order_status(session, State.pos_sl_order_id)
                         if status in ("complete", "filled"):
-                            log.info(f"🛡️ Exchange SL Order {State.pos_sl_order_id} hit! Resetting state.")
-                            # Exit premium is approx sl_premium
-                            State.reset()
+                            log.info(f"🛡️ Exchange SL Order {State.pos_sl_order_id} hit! Triggering close logic.")
+                            await close_position(session, "EXCHANGE_HARD_SL_HIT", skip_sell_order=True)
                             continue
 
-                    # Option premium from quotes API (Day's Open strategy logic)
                     opt_premium = await UpstoxClient.get_option_premium(session, State.pos_ins_key)
                     opt_ltp = opt_premium if opt_premium is not None else State.pos_entry
-                    # For any BUY, P&L = (LTP - Entry) * Qty
                     pnl = (opt_ltp - State.pos_entry) * State.pos_qty
 
-                    # Premium-based SL/TP exits (Buying strategy: Premium RISE = Profit, Premium FALL = Loss)
                     if opt_ltp <= State.pos_sl_premium:
                         await close_position(session, "SL_HIT_PREMIUM")
                     elif opt_ltp >= State.pos_tp_premium:
                         await close_position(session, "TP_HIT_PREMIUM")
                     
-                    # Clean Dashboard View (Only if still in trade after exit check)
                     if State.in_trade:
                         print_trade_dashboard(
                             spot, opt_ltp, State.pos_entry, 
@@ -860,14 +829,15 @@ async def main_loop():
                         )
 
                 if signal and not State.in_trade:
-                    # Optional: max trades per day
                     if MAX_TRADES_PER_DAY is not None and State.trades_today >= MAX_TRADES_PER_DAY:
-                        log.info(f"Max trades per day ({MAX_TRADES_PER_DAY}) reached. Skipping signal.")
+                        log.info(f"Max trades per day ({MAX_TRADES_PER_DAY}) reached. Stopping bot.")
+                        State.stop_trading = True
+                        await send_discord("Max Trades Reached", f"{MAX_TRADES_PER_DAY} trades taken today. Stopping bot.", color=0xFF0000)
+                        break
                     else:
                         strike = round(spot / STRIKE_STEP) * STRIKE_STEP
                         opt_type = "CE" if signal == "BUY_CALL" else "PE"
                         
-                        # Format standard Upstox Expiry
                         if expiry:
                             try:
                                 date_obj = datetime.strptime(expiry, "%Y-%m-%d")
@@ -879,11 +849,9 @@ async def main_loop():
                         else:
                             instrument_key = f"NSE_FO|{INSTRUMENT.split('|')[1].replace(' ','').upper()}{strike}{opt_type}"
                         
-                        # Position sizing: Fixed at 1 Lot (65 qty)
                         stop_distance = 1.5 * c5["atr_14"]
                         qty = LOT_SIZE
                         
-                        # Premium-based SL/TP (Fixed 1 Lot) - Precise resolution from chain_data
                         opt_ltp = None
                         if chain_data:
                             for strike_data in chain_data:
@@ -898,11 +866,8 @@ async def main_loop():
                             opt_ltp = await UpstoxClient.get_option_premium(session, instrument_key)
                         
                         if opt_ltp is None:
-                            opt_ltp = float(spot)  # fallback
+                            opt_ltp = float(spot)
                             
-                        # Option Premium Risk (Delta-Adjusted)
-                        # Since we trade ATM, premium moves roughly 50% of spot movement
-                        # For all BOUGHT options (Calls & Puts), we want premium to RISE.
                         base_risk = stop_distance * DELTA_APPROX
                         risk_per_unit = min(base_risk, opt_ltp * 0.7)
                         
@@ -919,7 +884,6 @@ async def main_loop():
                             tp_premium = round_to_tick(min(tp_premium, opt_ltp + (sup_spot_diff * DELTA_APPROX)))
                             log.info(f"Dynamic TP adjusted by OI Support: {support}")
 
-                        # Log professional signal alert
                         log_signal_alert(signal, strike, opt_ltp, sl_premium, tp_premium, spot, support, resistance, expiry)
                         
                         signal_msg = f"🚀 **SIGNAL GENERATED: {signal}**\n" \
@@ -932,7 +896,6 @@ async def main_loop():
                                      f"━━━━━━━━━━━━━━━━━━━━━━━━"
                         await send_discord("Signal Generated", signal_msg, color=0x9B59B6)
                         
-                        # Position tracking
                         State.pos_side = signal
                         State.pos_strike = strike
                         State.pos_opt_type = opt_type
@@ -971,7 +934,6 @@ async def main_loop():
             except Exception as e:
                 log.error(f"Error in main loop: {traceback.format_exc()}")
                 
-            # Dynamic sleep: 1s during trade for fast P&L monitoring, 10s otherwise
             sleep_time = 1 if State.in_trade else 10
             await asyncio.sleep(sleep_time)
 
