@@ -63,6 +63,7 @@ UPSTOX_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.e
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1412386951474057299/Jgft_nxzGxcfWOhoLbSWMde-_bwapvqx8l3VQGQwEoR7_8n4b9Q9zN242kMoXsVbLdvG"
 
 INSTRUMENT = "NSE_INDEX|Nifty 50"  # Or "NSE_INDEX|Nifty Bank"
+INSTRUMENT_FUT = "NSE_FO|51714"  # MUST USE NUMERICAL EXCHANGE TOKEN FOR FUTURES (e.g. 51714 for Nifty March 2026)
 IS_BANKNIFTY = "BANK" in INSTRUMENT.upper()
 LOT_SIZE = 15 if IS_BANKNIFTY else 65
 STRIKE_STEP = 100 if IS_BANKNIFTY else 50  # NIFTY 50 pt, BANKNIFTY 100 pt
@@ -708,7 +709,15 @@ async def main_loop():
                 # 1. Fetch 5m & 15m Concurrently
                 t1 = UpstoxClient.get_candles(session, INSTRUMENT, "5minute")
                 t2 = UpstoxClient.get_candles(session, INSTRUMENT, "15minute")
-                df_5m, df_15m = await asyncio.gather(t1, t2)
+                t3 = UpstoxClient.get_candles(session, INSTRUMENT_FUT, "5minute")
+                t4 = UpstoxClient.get_candles(session, INSTRUMENT_FUT, "15minute")
+                df_5m, df_15m, df_5m_fut, df_15m_fut = await asyncio.gather(t1, t2, t3, t4)
+                
+                # INJECT FUTURES VOLUME INTO SPOT CACHE
+                if not df_5m_fut.empty:
+                    df_5m["volume"] = df_5m["datetime"].map(df_5m_fut.set_index("datetime")["volume"]).fillna(1)
+                if not df_15m_fut.empty:
+                    df_15m["volume"] = df_15m["datetime"].map(df_15m_fut.set_index("datetime")["volume"]).fillna(1)
                 
                 # Fetch Option Chain independently for dashboard regardless of candle failures
                 support, resistance, expiry, chain_data = await UpstoxClient.get_option_chain(session, INSTRUMENT)
@@ -883,6 +892,11 @@ async def main_loop():
                             sup_spot_diff = spot - float(support)
                             tp_premium = round_to_tick(min(tp_premium, opt_ltp + (sup_spot_diff * DELTA_APPROX)))
                             log.info(f"Dynamic TP adjusted by OI Support: {support}")
+
+                        # --- MINIMUM REWARD GUARD ---
+                        if (tp_premium - opt_ltp) < 10:
+                            log.warning(f"⚠ TRADE SKIPPED: Target is only {tp_premium - opt_ltp:.2f} pts away (Minimum 10 pts required). Too close to OI Wall.")
+                            continue
 
                         log_signal_alert(signal, strike, opt_ltp, sl_premium, tp_premium, spot, support, resistance, expiry)
                         
