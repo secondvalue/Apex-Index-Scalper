@@ -59,7 +59,7 @@ from datetime import datetime, date, timedelta, timezone
 # =============================================================================
 # CONFIGURATION (EDIT HERE)
 # =============================================================================
-UPSTOX_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI1NUJBOVgiLCJqdGkiOiI2OWMwYzA5NjllZjJhZTZmNDZkMjcwZGUiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc3NDIzOTg5NCwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxNzc0MzAzMjAwfQ.j26JFvcr89nb2Yv8LjYybwypMjTtE9RxEyfxIzIITlI"
+UPSTOX_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI1NUJBOVgiLCJqdGkiOiI2OWMyMDhhMmYwYzk4ODc1ZGE2NGQzYjYiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc3NDMyMzg3NCwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxNzc0Mzg5NjAwfQ.5r1J1HBNrYAoG8rgFC-E-WR1_t4EUmVdFsaHUsXUIB8"
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1412386951474057299/Jgft_nxzGxcfWOhoLbSWMde-_bwapvqx8l3VQGQwEoR7_8n4b9Q9zN242kMoXsVbLdvG"
 
 INSTRUMENT = "NSE_INDEX|Nifty 50"  # Or "NSE_INDEX|Nifty Bank"
@@ -69,14 +69,14 @@ LOT_SIZE = 15 if IS_BANKNIFTY else 65
 STRIKE_STEP = 100 if IS_BANKNIFTY else 50  # NIFTY 50 pt, BANKNIFTY 100 pt
 
 # --- RISK & POSITION SIZING ---
-CAPITAL = 100000           # Account balance for risk sizing
-RISK_PCT = 1.0             # Risk per trade = 1% of CAPITAL
 MAX_DAILY_LOSS = 3000      # Stop trading if daily loss exceeds this (₹)
 MAX_TRADES_PER_DAY = None  # Optional cap (e.g. 5); None = no limit
 DELTA_APPROX = 0.5         # Delta for ATM options (moves ~50% of spot)
 
 # --- EXECUTION ---
 EXECUTE_TRADE = False      # False = Paper trading; True = Live
+ENTRY_START_TIME = "09:45" # Start time for entry window (avoid opening volatility)
+ENTRY_END_TIME = "14:45"   # End time for entry window
 SQUARE_OFF_TIME = "15:15"  # Auto close all positions at 3:15 PM
 
 # --- LOGGING & DIRECTORIES ---
@@ -124,18 +124,17 @@ class State:
     pos_entry = 0.0
     pos_sl_premium = 0.0
     pos_tp_premium = 0.0
-    pos_stop = 0.0
-    pos_stop_distance = 0.0
     pos_qty = 0
-    pos_highest = 0.0
-    pos_lowest = 0.0
-    pos_tp_spot = 0.0
+    pos_highest_premium = 0.0
+    pos_trail_distance = 0.0
     pos_ins_key = None
 
     pos_breakeven_locked = False
-    pos_entry_spot = 0.0
     pos_entry_time = None
     pos_sl_order_id = None
+    
+    last_trade_candle = None
+    last_skipped_candle = None
     
     @classmethod
     def reset(cls):
@@ -148,14 +147,10 @@ class State:
         cls.pos_sl_premium = 0.0
         cls.pos_tp_premium = 0.0
         cls.pos_breakeven_locked = False
-        cls.pos_entry_spot = 0.0
-        cls.pos_stop = 0.0
-        cls.pos_stop_distance = 0.0
         cls.pos_qty = 0
-        cls.pos_highest = 0.0
-        cls.pos_lowest = 0.0
+        cls.pos_highest_premium = 0.0
+        cls.pos_trail_distance = 0.0
         cls.pos_ins_key = None
-        cls.pos_tp_spot = 0.0
         cls.pos_entry_time = None
         cls.pos_sl_order_id = None
 
@@ -366,10 +361,10 @@ def calc_indicators(df):
     # EMA 20
     df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
     
-    # VWAP
-    tp = (df["high"] + df["low"] + df["close"]) / 3
+    # VWAP (Calculated AFTER Futures volume injection)
+    df["tp"] = (df["high"] + df["low"] + df["close"]) / 3
     df["date"] = df["datetime"].dt.date
-    df["tp_vol"] = tp * df["volume"]
+    df["tp_vol"] = df["tp"] * df["volume"]
     df["cum_vol"] = df.groupby("date")["volume"].cumsum()
     df["cum_tp_vol"] = df.groupby("date")["tp_vol"].cumsum()
     df["vwap"] = df["cum_tp_vol"] / df["cum_vol"]
@@ -429,9 +424,9 @@ def print_market_snapshot(spot, df_5m, df_15m, signal, support, resistance, mark
 
     state_text = signal if signal else '⏸ WAITING FOR CONDITIONS'
     if market_status == "WAITING_FOR_OPEN":
-        state_text = "⏸ WAITING FOR ENTRY WINDOW (09:30 AM)"
+        state_text = f"⏸ WAITING FOR ENTRY WINDOW ({ENTRY_START_TIME})"
     elif market_status == "CLOSED_FOR_ENTRY":
-        state_text = "⏸ CLOSED FOR ENTRY (AFTER 14:45)"
+        state_text = f"⏸ CLOSED FOR ENTRY (AFTER {ENTRY_END_TIME})"
 
     snapshot = f"""{'=' * 85}
 ⚡ ALGO TRADER | {now} | {mode}
@@ -561,48 +556,30 @@ async def place_sl_order(session, instrument_token, qty, trigger_price):
 async def ltp_loop(session):
     while True:
         if State.in_trade and State.pos_ins_key:
-            res = await UpstoxClient.get(session, "/market-quote/ltp", {"instrument_key": INSTRUMENT})
-            if res:
-                spot_ltp = res.get(INSTRUMENT.replace("|", ":"), {}).get("last_price", 0)
-                if spot_ltp > 0:
-                    if State.pos_side == "BUY_CALL":
-                        # Aggressive Profit Locking: If price moves 0.7R into profit, lock Break-Even
-                        if not State.pos_breakeven_locked and spot_ltp >= (State.pos_entry_spot + 0.7 * State.pos_stop_distance):
-                            State.pos_breakeven_locked = True
-                            State.pos_stop = State.pos_entry_spot
-                            log.info(f"🛡️ Aggressive BE Locked: Stop moved to Entry ({State.pos_entry_spot})")
-                            await send_discord("Profit Protection", f"🛡️ **BE Locked:** SL moved to Entry price ({State.pos_entry_spot})", color=0x3498DB)
-                        
-                        State.pos_highest = max(State.pos_highest, spot_ltp)
-                        
-                        # Dynamic Trailing: Maintain 1.5x ATR distance after BE is locked
-                        trail_dist = State.pos_stop_distance if not State.pos_breakeven_locked else (State.pos_stop_distance * 1.0)
-                        new_stop = State.pos_highest - trail_dist
-                        State.pos_stop = max(State.pos_stop, new_stop)
-                        
-                        if spot_ltp <= State.pos_stop:
-                            log.info(f"STOP LOSS HIT at Spot {spot_ltp}! Exiting position.")
-                            await close_position(session, "SL_HIT")
-                            
-                    elif State.pos_side == "BUY_PUT":
-                        # Aggressive Profit Locking: If price moves 0.7R into profit, lock Break-Even
-                        if not State.pos_breakeven_locked and spot_ltp <= (State.pos_entry_spot - 0.7 * State.pos_stop_distance):
-                            State.pos_breakeven_locked = True
-                            State.pos_stop = State.pos_entry_spot
-                            log.info(f"🛡️ Aggressive BE Locked: Stop moved to Entry ({State.pos_entry_spot})")
-                            await send_discord("Profit Protection", f"🛡️ **BE Locked:** SL moved to Entry price ({State.pos_entry_spot})", color=0x3498DB)
-                            
-                        State.pos_lowest = min(State.pos_lowest, spot_ltp) if State.pos_lowest > 0 else spot_ltp
-                        
-                        # Dynamic Trailing: Maintain 1.5x ATR distance after BE is locked
-                        trail_dist = State.pos_stop_distance if not State.pos_breakeven_locked else (State.pos_stop_distance * 1.0)
-                        new_stop = State.pos_lowest + trail_dist
-                        if State.pos_stop == 0: State.pos_stop = new_stop
-                        State.pos_stop = min(State.pos_stop, new_stop)
-                        
-                        if spot_ltp >= State.pos_stop:
-                            log.info(f"STOP LOSS HIT at Spot {spot_ltp}! Exiting position.")
-                            await close_position(session, "SL_HIT")
+            opt_ltp = await UpstoxClient.get_option_premium(session, State.pos_ins_key)
+            if opt_ltp is not None and opt_ltp > 0:
+                # Aggressive Profit Locking: If price moves 0.7R into profit, lock Break-Even
+                if not State.pos_breakeven_locked and opt_ltp >= (State.pos_entry + 0.7 * State.pos_trail_distance):
+                    State.pos_breakeven_locked = True
+                    State.pos_sl_premium = max(State.pos_sl_premium, State.pos_entry)
+                    log.info(f"🛡️ Aggressive BE Locked: Premium Stop moved to Entry (₹{State.pos_entry})")
+                    await send_discord("Profit Protection", f"🛡️ **BE Locked:** SL moved to Entry Premium (₹{State.pos_entry})", color=0x3498DB)
+                
+                State.pos_highest_premium = max(State.pos_highest_premium, opt_ltp)
+                
+                # Dynamic Trailing: Maintain trailing distance behind highest premium reached
+                trail_dist = State.pos_trail_distance if not State.pos_breakeven_locked else (State.pos_trail_distance * 1.0)
+                new_stop = max(State.pos_sl_premium, State.pos_highest_premium - trail_dist)
+                
+                if new_stop > State.pos_sl_premium:
+                    State.pos_sl_premium = round_to_tick(new_stop)
+
+                if opt_ltp <= State.pos_sl_premium:
+                    log.info(f"STOP LOSS HIT at Premium ₹{opt_ltp}! Exiting position.")
+                    await close_position(session, "SL_HIT")
+                elif opt_ltp >= State.pos_tp_premium:
+                    log.info(f"TARGET PROFIT HIT at Premium ₹{opt_ltp}! Exiting position.")
+                    await close_position(session, "TP_HIT")
         await asyncio.sleep(1)
 
 # =============================================================================
@@ -620,10 +597,15 @@ async def close_position(session, reason="SQUARE_OFF", skip_sell_order=False):
     if not skip_sell_order:
         # Cancel any pending exchange SL order first
         if State.pos_sl_order_id:
-            await cancel_order(session, State.pos_sl_order_id)
-
-        # Place SELL order
-        await place_order(session, State.pos_ins_key, State.pos_qty, "SELL")
+            status = await check_order_status(session, State.pos_sl_order_id)
+            if status in ("complete", "filled"):
+                log.info(f"🚫 Exchange SL already hit! Skipping redundant market sell.")
+            else:
+                await cancel_order(session, State.pos_sl_order_id)
+                # Place SELL order
+                await place_order(session, State.pos_ins_key, State.pos_qty, "SELL")
+        else:
+            await place_order(session, State.pos_ins_key, State.pos_qty, "SELL")
     else:
         # If exchange hard SL was already executed, exit price is exactly the SL premium (or near it)
         if exit_price is None or exit_price == State.pos_entry:
@@ -699,10 +681,13 @@ async def main_loop():
             if now.hour > 15 or (now.hour == 15 and now.minute >= 30):
                 break # Market closed
 
-            # Ensure we only ENTER new trades between 09:30 and 14:45 for pure intraday.
+            # Ensure we only ENTER new trades within the configured window.
+            start_h, start_m = map(int, ENTRY_START_TIME.split(":"))
+            end_h, end_m = map(int, ENTRY_END_TIME.split(":"))
+            
             is_valid_entry_time = (
-                (now.hour > 9 or (now.hour == 9 and now.minute >= 30))
-                and (now.hour < 14 or (now.hour == 14 and now.minute < 45))
+                (now.hour > start_h or (now.hour == start_h and now.minute >= start_m))
+                and (now.hour < end_h or (now.hour == end_h and now.minute < end_m))
             )
 
             try:
@@ -773,7 +758,7 @@ async def main_loop():
                 # -----------------------------------------------------------------
                 market_status = "TRADING"
                 if not is_valid_entry_time:
-                    if now.hour < 9 or (now.hour == 9 and now.minute < 30):
+                    if now.hour < start_h or (now.hour == start_h and now.minute < start_m):
                         market_status = "WAITING_FOR_OPEN"
                     else:
                         market_status = "CLOSED_FOR_ENTRY"
@@ -790,6 +775,10 @@ async def main_loop():
                 if is_valid_entry_time and is_15m_dn and is_5m_dn and atr_expand:
                     if imbalance < -0.3 or bear_trap:
                         signal = "BUY_PUT"
+                        
+                # Enforce Cooldown / Stop Revenge Trading on the same candle
+                if signal and State.last_trade_candle is not None and c5["datetime"] == State.last_trade_candle:
+                    signal = None
 
                 spot = c5["close"] if spot == 0 else spot
                 
@@ -797,11 +786,11 @@ async def main_loop():
                 if signal and not State.in_trade and not is_valid_entry_time:
                     log.info(
                         f"Signal {signal} detected at {now.strftime('%H:%M')} "
-                        f"but outside entry window (09:30–14:45). No trade taken."
+                        f"but outside entry window ({ENTRY_START_TIME}–{ENTRY_END_TIME}). No trade taken."
                     )
                     log_out(
                         f"\n⚠ Signal {signal} detected but outside entry hours "
-                        f"(09:30–14:45). Waiting for next session."
+                        f"({ENTRY_START_TIME}–{ENTRY_END_TIME}). Waiting for next session."
                     )
                     signal = None
 
@@ -895,7 +884,9 @@ async def main_loop():
 
                         # --- MINIMUM REWARD GUARD ---
                         if (tp_premium - opt_ltp) < 10:
-                            log.warning(f"⚠ TRADE SKIPPED: Target is only {tp_premium - opt_ltp:.2f} pts away (Minimum 10 pts required). Too close to OI Wall.")
+                            if getattr(State, "last_skipped_candle", None) != c5["datetime"]:
+                                log.warning(f"⚠ TRADE SKIPPED: Target is only {tp_premium - opt_ltp:.2f} pts away (Minimum 10 pts required). Too close to OI Wall.")
+                                State.last_skipped_candle = c5["datetime"]
                             continue
 
                         log_signal_alert(signal, strike, opt_ltp, sl_premium, tp_premium, spot, support, resistance, expiry)
@@ -914,17 +905,14 @@ async def main_loop():
                         State.pos_strike = strike
                         State.pos_opt_type = opt_type
                         State.pos_entry = opt_ltp
-                        State.pos_entry_spot = spot
-                        State.pos_stop_distance = stop_distance
-                        State.pos_stop = spot - stop_distance if signal == "BUY_CALL" else spot + stop_distance
                         State.pos_qty = qty
-                        State.pos_highest = spot
-                        State.pos_lowest = spot
                         State.pos_sl_premium = sl_premium
                         State.pos_tp_premium = tp_premium
-                        State.pos_tp_spot = spot + 1.5 * stop_distance if signal == "BUY_CALL" else spot - 1.5 * stop_distance
+                        State.pos_highest_premium = opt_ltp
+                        State.pos_trail_distance = risk_per_unit
                         State.pos_ins_key = instrument_key
                         State.pos_entry_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        State.last_trade_candle = c5["datetime"]
                         State.in_trade = True
                         
                         await place_order(session, State.pos_ins_key, qty, "BUY")
