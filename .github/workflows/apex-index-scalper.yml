@@ -31,7 +31,7 @@ jobs:
     
     - name: Run trading bot
       run: python -u algo_trader.py
-      timeout-minutes: 390  # 6.5 hours (market session)
+      timeout-minutes: 480  # 6.5 hours (market session)
       env:
         PYTHONUNBUFFERED: 1      # Force unbuffered output
         TZ: 'Asia/Kolkata'       # Set IST timezone
