@@ -59,7 +59,7 @@ from datetime import datetime, date, timedelta, timezone
 # =============================================================================
 # CONFIGURATION (EDIT HERE)
 # =============================================================================
-UPSTOX_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI1NUJBOVgiLCJqdGkiOiI2OWM1ZmJiODhkZjQ0NTM3ZTQ4MzFjOGQiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc3NDU4MjcxMiwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxNzc0NjQ4ODAwfQ.94iDnlZIv__I7trwlOuKofMie5MzMSY4pvjHvYl1288"
+UPSTOX_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI1NUJBOVgiLCJqdGkiOiI2OWM5ZjNkOGFiZTEwNzY4YTMwM2FhYWMiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc3NDg0Mjg0MCwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxNzc0OTA4MDAwfQ.QMhAdqQ9S1dz_x5UiS5aaPvqB0GePB2KNO47_3CNc8g"
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1412386951474057299/Jgft_nxzGxcfWOhoLbSWMde-_bwapvqx8l3VQGQwEoR7_8n4b9Q9zN242kMoXsVbLdvG"
 
 INSTRUMENT = "NSE_INDEX|Nifty 50"  # Or "NSE_INDEX|Nifty Bank"
